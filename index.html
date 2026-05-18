@@ -1,0 +1,1082 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Together We Go — 2 Player Co-op</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #000;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    overflow: hidden;
+    font-family: 'Segoe UI', Arial, sans-serif;
+  }
+  canvas { display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ═══════════════════════════════════════════════════════════
+//  TOGETHER WE GO — 2-Player Co-op Platformer
+//  P1: WASD   |   P2: Arrow Keys
+// ═══════════════════════════════════════════════════════════
+
+const C = document.getElementById('c');
+const ctx = C.getContext('2d');
+const W = 900, H = 560;
+C.width = W; C.height = H;
+
+// ─── AUDIO ────────────────────────────────────────────────
+let AC = null;
+function getAC() {
+  if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+  return AC;
+}
+function tone(f, t, type = 'square', vol = 0.25, f2 = null) {
+  try {
+    const ac = getAC();
+    const o = ac.createOscillator();
+    const g = ac.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f, ac.currentTime);
+    if (f2 !== null) o.frequency.exponentialRampToValueAtTime(f2, ac.currentTime + t);
+    g.gain.setValueAtTime(vol, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + t);
+    o.connect(g); g.connect(ac.destination);
+    o.start(); o.stop(ac.currentTime + t);
+  } catch(e) {}
+}
+function jumpSfx()   { tone(380, 0.12, 'square', 0.18, 560); }
+function coinSfx()   { tone(880, 0.08, 'sine', 0.2); tone(1100, 0.08, 'sine', 0.2, 1500); }
+function stepSfx()   { tone(220, 0.06, 'square', 0.12, 110); }
+function unlockSfx() { tone(440, 0.15, 'sine', 0.3, 660); tone(660, 0.15, 'sine', 0.3, 880); tone(880, 0.25, 'sine', 0.3); }
+function winSfx()    { [523,659,784,1047].forEach((f,i) => setTimeout(() => tone(f, 0.35, 'sine', 0.3), i*160)); }
+function loseSfx()   { tone(200, 0.4, 'sawtooth', 0.2, 80); }
+function syncSfx()   { tone(600, 0.1, 'sine', 0.25); tone(900, 0.15, 'sine', 0.3); }
+
+// ─── PHYSICS CONSTANTS ────────────────────────────────────
+const GRAV = 0.55;
+const JUMP = -13;
+const SPD  = 4.2;
+
+// ─── INPUT ────────────────────────────────────────────────
+const keys = {};
+const p1keys = { left: 'KeyA', right: 'KeyD', up: 'KeyW' };
+const p2keys = { left: 'ArrowLeft', right: 'ArrowRight', up: 'ArrowUp' };
+document.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  e.preventDefault();
+});
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// ─── PARTICLES ────────────────────────────────────────────
+const parts = [];
+function spawnPart(x, y, color, n = 8) {
+  for (let i = 0; i < n; i++) {
+    const a = (Math.PI * 2 * i) / n + Math.random() * 0.5;
+    const spd = 1.5 + Math.random() * 2.5;
+    parts.push({
+      x, y,
+      vx: Math.cos(a) * spd,
+      vy: Math.sin(a) * spd - 1,
+      life: 1, decay: 0.03 + Math.random() * 0.02,
+      r: 3 + Math.random() * 3,
+      color
+    });
+  }
+}
+function updateParts() {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.x += p.vx; p.y += p.vy; p.vy += 0.1;
+    p.life -= p.decay;
+    if (p.life <= 0) parts.splice(i, 1);
+  }
+}
+function drawParts() {
+  parts.forEach(p => {
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r * p.life, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+}
+
+// ─── PLAYER ───────────────────────────────────────────────
+class Player {
+  constructor(id, x, y, color, keyMap) {
+    this.id = id;
+    this.x = x; this.y = y;
+    this.w = 28; this.h = 38;
+    this.vx = 0; this.vy = 0;
+    this.color = color;
+    this.glowColor = color;
+    this.km = keyMap;
+    this.onGround = false;
+    this.facing = 1;
+    this.walkT = 0;
+    this.jumpT = 0;
+    this.hasKey = false;
+    this.atExit = false;
+    this.dead = false;
+    this.onPlate = false;
+    this.steppingOn = null;
+  }
+  update(plats, plates, doors, sws, keys_obj, exitDoor, lock) {
+    const left  = keys[this.km.left];
+    const right = keys[this.km.right];
+    const up    = keys[this.km.up];
+    if (left)  { this.vx = -SPD; this.facing = -1; }
+    else if (right) { this.vx = SPD; this.facing = 1; }
+    else this.vx *= 0.7;
+    if (up && this.onGround) { this.vy = JUMP; this.onGround = false; jumpSfx(); this.jumpT = 12; }
+    if (this.jumpT > 0) this.jumpT--;
+    this.vy += GRAV;
+    this.x += this.vx;
+    this.y += this.vy;
+    if (this.walkT > 0) this.walkT--;
+    if (Math.abs(this.vx) > 0.5) this.walkT = 6;
+    // wall clamp
+    if (this.x < 0) this.x = 0;
+    if (this.x + this.w > W) this.x = W - this.w;
+    // platform collide
+    this.onGround = false;
+    plats.forEach(p => {
+      if (this.x + this.w > p.x && this.x < p.x + p.w &&
+          this.y + this.h > p.y && this.y + this.h < p.y + p.h + 12 && this.vy >= 0) {
+        this.y = p.y - this.h;
+        this.vy = 0;
+        this.onGround = true;
+      }
+    });
+    // fall death
+    if (this.y > H + 80) { this.dead = true; }
+    // plate logic
+    this.steppingOn = null;
+    plates.forEach(pl => {
+      const cx = this.x + this.w / 2, cy = this.y + this.h;
+      if (cx > pl.x && cx < pl.x + pl.w && cy >= pl.y - 4 && cy <= pl.y + 12 && this.onGround) {
+        this.steppingOn = pl;
+        if (!this.onPlate) stepSfx();
+      }
+    });
+    this.onPlate = !!this.steppingOn;
+    // switch toggle
+    sws.forEach(sw => {
+      const cx = this.x + this.w / 2, cy = this.y + this.h;
+      if (cx > sw.x && cx < sw.x + sw.w && cy >= sw.y - 4 && cy <= sw.y + 12 && this.onGround) {
+        if (!sw.wasPressed) {
+          sw.active = !sw.active;
+          sw.wasPressed = true;
+          spawnPart(sw.x + sw.w/2, sw.y, sw.active ? '#00ff88' : '#ff6666', 12);
+          tone(sw.active ? 660 : 330, 0.2, 'sine', 0.25);
+          // activate linked doors
+          sw.links.forEach(lid => {
+            const d = doors.find(dd => dd.id === lid);
+            if (d) d.open = sw.active;
+          });
+        }
+      } else if (!(cx > sw.x && cx < sw.x + sw.w && cy >= sw.y - 4 && cy <= sw.y + 12 && this.onGround)) {
+        sw.wasPressed = false;
+      }
+    });
+    // key collect
+    keys_obj.forEach(k => {
+      if (!k.collected && this.x + this.w > k.x && this.x < k.x + k.sz && this.y + this.h > k.y && this.y < k.y + k.sz) {
+        k.collected = true; k.who = this.id;
+        this.hasKey = true;
+        coinSfx();
+        spawnPart(k.x + k.sz/2, k.y + k.sz/2, this.color, 15);
+      }
+    });
+    // lock check
+    if (lock && lock.p1Key && lock.p2Key) {
+      const cx = this.x + this.w/2, cy = this.y + this.h/2;
+      if (cx > lock.x && cx < lock.x + lock.w && cy > lock.y && cy < lock.y + lock.h) {
+        if (!lock.opening) { lock.opening = true; lock.openCount = 60; unlockSfx(); }
+      }
+    }
+    // exit check
+    if (exitDoor) {
+      const cx = this.x + this.w/2, cy = this.y + this.h/2;
+      this.atExit = (cx > exitDoor.x && cx < exitDoor.x + exitDoor.w && cy > exitDoor.y && cy < exitDoor.y + exitDoor.h);
+    }
+  }
+  draw() {
+    ctx.save();
+    ctx.translate(this.x + this.w/2, this.y + this.h/2);
+    // glow
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, this.w);
+    g.addColorStop(0, this.glowColor + '44');
+    g.addColorStop(1, 'transparent');
+    ctx.fillStyle = g;
+    ctx.fillRect(-this.w, -this.h, this.w*2, this.h*2);
+    // shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.beginPath();
+    ctx.ellipse(0, this.h/2 + 2, this.w/2, 5, 0, 0, Math.PI*2);
+    ctx.fill();
+    // body bob
+    const bob = this.onGround && this.walkT > 0 ? Math.sin(Date.now() * 0.02) * 1.5 : 0;
+    // legs
+    const legSwing = this.onGround && Math.abs(this.vx) > 0.5 ? Math.sin(Date.now() * 0.018) * 5 : 0;
+    ctx.fillStyle = this.id === 1 ? '#cc3333' : '#3366cc';
+    ctx.fillRect(-this.w/2 + 2, 4 + bob, 10, 14);
+    ctx.fillRect(this.w/2 - 12, 4 + bob, 10, 14);
+    // body
+    ctx.fillStyle = this.id === 1 ? '#e84040' : '#4488ff';
+    roundRect(ctx, -this.w/2 + 3, -this.h/2 + 10 + bob, this.w - 6, this.h - 20, 6);
+    // head
+    ctx.fillStyle = this.id === 1 ? '#ffcc99' : '#ffddaa';
+    roundRect(ctx, -this.w/2 + 5, -this.h/2 + bob, this.w - 10, 14, 5);
+    // eyes
+    ctx.fillStyle = '#333';
+    const eyeOff = this.facing > 0 ? 2 : -2;
+    ctx.beginPath();
+    ctx.arc(-3 + eyeOff, -this.h/2 + 7 + bob, 2.5, 0, Math.PI*2);
+    ctx.arc(5 + eyeOff, -this.h/2 + 7 + bob, 2.5, 0, Math.PI*2);
+    ctx.fill();
+    // arms
+    ctx.fillStyle = this.id === 1 ? '#e84040' : '#4488ff';
+    ctx.save();
+    ctx.translate(this.facing > 0 ? this.w/2 - 6 : -this.w/2 + 6, -this.h/2 + 16 + bob);
+    ctx.rotate(Math.sin(Date.now() * 0.015) * 0.3);
+    ctx.fillRect(-3, 0, 6, 14);
+    ctx.restore();
+    // hat
+    ctx.fillStyle = this.id === 1 ? '#cc2222' : '#2255cc';
+    ctx.fillRect(-this.w/2 + 3, -this.h/2 - 2 + bob, this.w - 6, 5);
+    // key indicator
+    if (this.hasKey) {
+      ctx.fillStyle = this.color;
+      ctx.font = 'bold 14px Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText('🔑', 0, -this.h/2 - 8);
+    }
+    // player label
+    ctx.fillStyle = this.color;
+    ctx.font = 'bold 11px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(this.id === 1 ? 'P1' : 'P2', 0, -this.h/2 - 18);
+    ctx.restore();
+  }
+}
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+  ctx.fill();
+}
+
+// ─── GAME OBJECTS ─────────────────────────────────────────
+class Platform {
+  constructor(x, y, w, h, style = 'grass') {
+    this.x = x; this.y = y; this.w = w; this.h = h; this.style = style;
+  }
+  draw() {
+    const {x, y, w, h, style} = this;
+    const grad = ctx.createLinearGradient(x, y, x, y + h);
+    if (style === 'stone') {
+      grad.addColorStop(0, '#8a8a8a'); grad.addColorStop(1, '#5a5a5a');
+    } else if (style === 'wood') {
+      grad.addColorStop(0, '#a0724a'); grad.addColorStop(1, '#7a5230');
+    } else if (style === 'cloud') {
+      grad.addColorStop(0, '#ffffffdd'); grad.addColorStop(1, '#e8f4f8cc');
+    } else {
+      grad.addColorStop(0, '#5dba3a'); grad.addColorStop(1, '#3d8a1a');
+    }
+    ctx.fillStyle = grad;
+    if (style === 'cloud') {
+      ctx.beginPath(); ctx.ellipse(x+w/2, y+h/2, w/2, h/2, 0, 0, Math.PI*2); ctx.fill();
+      return;
+    }
+    ctx.fillRect(x, y, w, h);
+    // top highlight
+    ctx.fillStyle = style === 'stone' ? '#aaa' : style === 'wood' ? '#c09060' : '#80d84a';
+    ctx.fillRect(x, y, w, 4);
+    // bottom shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.2)';
+    ctx.fillRect(x, y + h - 3, w, 3);
+    // grass/snow details
+    if (style === 'grass') {
+      ctx.fillStyle = '#4aaa20';
+      for (let i = 0; i < w; i += 14) {
+        ctx.fillRect(x + i + 5, y - 2, 4, 5);
+      }
+    }
+    if (style === 'stone') {
+      ctx.strokeStyle = '#666'; ctx.lineWidth = 1;
+      for (let i = 0; i < h; i += 14) ctx.beginPath(), ctx.moveTo(x, y+i), ctx.lineTo(x+w, y+i), ctx.stroke();
+      for (let i = 0; i < w; i += 28) ctx.beginPath(), ctx.moveTo(x+i, y), ctx.lineTo(x+i, y+h), ctx.stroke();
+    }
+    if (style === 'wood') {
+      ctx.strokeStyle = '#8a6030'; ctx.lineWidth = 1;
+      for (let i = 0; i < w; i += 18) ctx.beginPath(), ctx.moveTo(x+i, y), ctx.lineTo(x+i, y+h), ctx.stroke();
+    }
+  }
+}
+
+class Plate {
+  constructor(x, y, w, color, links) {
+    this.x = x; this.y = y; this.w = w; this.color = color; this.links = links;
+  }
+  isPressed() { return !!this.who; }
+  draw() {
+    const pressed = this.isPressed();
+    const ph = pressed ? 6 : 10;
+    ctx.fillStyle = pressed ? this.color : '#444';
+    ctx.fillRect(this.x, this.y - ph + 10, this.w, ph);
+    ctx.fillStyle = this.color;
+    roundRect(ctx, this.x + 2, this.y - ph + 4, this.w - 4, ph, 4);
+    if (!pressed) {
+      ctx.fillStyle = this.color + 'aa';
+      ctx.fillRect(this.x + 4, this.y - 6, this.w - 8, 3);
+    }
+  }
+}
+
+class Switch {
+  constructor(x, y, color, links = []) {
+    this.x = x; this.y = y; this.w = 36; this.h = 20;
+    this.color = color; this.links = links;
+    this.active = false; this.wasPressed = false;
+  }
+  draw() {
+    const ph = this.active ? 4 : 16;
+    ctx.fillStyle = '#555';
+    ctx.fillRect(this.x, this.y, this.w, this.h);
+    ctx.fillStyle = this.active ? this.color : '#888';
+    roundRect(ctx, this.x + 3, this.y + (this.active ? 12 : 2), this.w - 6, ph, 3);
+    // sparkle
+    if (this.active) {
+      ctx.fillStyle = this.color + '66';
+      ctx.beginPath();
+      ctx.arc(this.x + this.w/2, this.y + 4, 10, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+}
+
+class Door {
+  constructor(x, y, h, color, id) {
+    this.x = x; this.y = y; this.w = 36; this.hh = h; this.color = color; this.id = id;
+    this.open = false; this.openT = 0;
+  }
+  update() {
+    if (this.open && this.openT < 1) this.openT = Math.min(1, this.openT + 0.06);
+    else if (!this.open && this.openT > 0) this.openT = Math.max(0, this.openT - 0.06);
+  }
+  draw() {
+    const gap = this.hh * this.openT;
+    // frame
+    ctx.fillStyle = '#555';
+    ctx.fillRect(this.x - 4, this.y - 4, this.w + 8, this.hh + 8);
+    ctx.fillStyle = this.color + 'cc';
+    ctx.fillRect(this.x, this.y, this.w, gap);
+    ctx.fillRect(this.x, this.y + gap, this.w, this.hh - gap);
+    // bars
+    ctx.strokeStyle = '#333'; ctx.lineWidth = 2;
+    for (let i = 0; i < gap; i += 14) {
+      ctx.beginPath(); ctx.moveTo(this.x, this.y + i); ctx.lineTo(this.x + this.w, this.y + i); ctx.stroke();
+    }
+    for (let i = gap; i < this.hh; i += 14) {
+      ctx.beginPath(); ctx.moveTo(this.x, this.y + i); ctx.lineTo(this.x + this.w, this.y + i); ctx.stroke();
+    }
+  }
+  collides() { return this.openT < 0.95; }
+}
+
+class KeyItem {
+  constructor(x, y, color, sz = 28) {
+    this.x = x; this.y = y; this.color = color; this.sz = sz;
+    this.collected = false; this.who = null;
+  }
+  draw() {
+    if (this.collected) return;
+    const t = Date.now() * 0.003;
+    const by = Math.sin(t) * 4;
+    // glow
+    ctx.fillStyle = this.color + '44';
+    ctx.beginPath(); ctx.arc(this.x + this.sz/2, this.y + this.sz/2 + by, this.sz, 0, Math.PI*2); ctx.fill();
+    // key shape
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.arc(this.x + this.sz/2, this.y + 8 + by, 9, 0, Math.PI*2);
+    ctx.fill();
+    ctx.fillRect(this.x + this.sz/2 - 3, this.y + 14 + by, 6, 16);
+    ctx.fillRect(this.x + this.sz/2 + 3, this.y + 24 + by, 6, 3);
+    ctx.fillRect(this.x + this.sz/2 + 3, this.y + 19 + by, 5, 3);
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(this.x + this.sz/2, this.y + 8 + by, 4, 0, Math.PI*2); ctx.fill();
+  }
+}
+
+class Lock {
+  constructor(x, y, w, h) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.p1Key = false; this.p2Key = false;
+    this.opening = false; this.openCount = 0;
+    this.t = 0;
+  }
+  get bothKeys() { return this.p1Key && this.p2Key; }
+  draw() {
+    this.t += 0.05;
+    const openAmt = this.opening ? Math.min(1, this.openCount / 60) : (this.bothKeys ? 1 : 0);
+    const gap = this.h * openAmt;
+    ctx.fillStyle = '#555';
+    ctx.fillRect(this.x - 4, this.y - 4, this.w + 8, this.h + 8);
+    ctx.fillStyle = openAmt > 0.5 ? '#44cc66' : '#cc4444';
+    ctx.fillRect(this.x, this.y, this.w, gap);
+    ctx.fillRect(this.x, this.y + gap, this.w, this.h - gap);
+    // lock icon
+    if (openAmt < 0.9) {
+      const lc = '#ffcc00';
+      ctx.fillStyle = lc;
+      ctx.font = '20px Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText('🔒', this.x + this.w/2, this.y + this.h/2 + 6);
+      if (!this.p1Key) {
+        ctx.fillStyle = '#e84040cc'; ctx.font = 'bold 10px Arial';
+        ctx.fillText('P1', this.x + this.w/2 - 14, this.y + this.h + 12);
+      }
+      if (!this.p2Key) {
+        ctx.fillStyle = '#4488ffcc'; ctx.font = 'bold 10px Arial';
+        ctx.fillText('P2', this.x + this.w/2 + 14, this.y + this.h + 12);
+      }
+    } else {
+      ctx.fillStyle = '#44ff88';
+      ctx.font = '20px Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText('🔓', this.x + this.w/2, this.y + this.h/2 + 6);
+    }
+  }
+  collides() { return this.opening ? (this.openCount / 60) < 0.95 : true; }
+}
+
+class ExitDoor {
+  constructor(x, y, w, h) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.t = 0;
+  }
+  draw() {
+    this.t += 0.05;
+    const pulse = 0.8 + Math.sin(this.t * 2) * 0.2;
+    // arch
+    ctx.fillStyle = '#2a1a00';
+    ctx.beginPath();
+    ctx.arc(this.x + this.w/2, this.y + this.h, this.w/2, Math.PI, 0);
+    ctx.rect(this.x, this.y + this.h/2, this.w, this.h/2);
+    ctx.fill();
+    // inner glow
+    const g = ctx.createRadialGradient(this.x + this.w/2, this.y + this.h/2, 0, this.x + this.w/2, this.y + this.h/2, this.w);
+    g.addColorStop(0, `rgba(255,220,50,${0.5 * pulse})`);
+    g.addColorStop(1, 'transparent');
+    ctx.fillStyle = g;
+    ctx.fillRect(this.x - 20, this.y - 20, this.w + 40, this.h + 40);
+    // border
+    ctx.strokeStyle = '#ffcc00';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(this.x + this.w/2, this.y + this.h, this.w/2 - 2, Math.PI, 0);
+    ctx.moveTo(this.x, this.y + this.h/2);
+    ctx.lineTo(this.x, this.y + this.h);
+    ctx.moveTo(this.x + this.w, this.y + this.h/2);
+    ctx.lineTo(this.x + this.w, this.y + this.h);
+    ctx.stroke();
+    // label
+    ctx.fillStyle = '#ffcc00';
+    ctx.font = 'bold 13px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('EXIT', this.x + this.w/2, this.y + this.h/2 + 5);
+  }
+}
+
+// ─── LEVEL DEFINITIONS ─────────────────────────────────────
+// Each level: { bg, platforms, plates, switches, doors, keys, lock, exit, p1start, p2start, hint, name }
+const LEVELS = [
+  // ── LEVEL 1: THE DOOR ──────────────────────────────────
+  {
+    bg: ['#1a3a2a','#0d2218'],
+    name: 'Level 1 — The Door',
+    hint: 'One holds, one goes!',
+    p1start: [60, 380], p2start: [80, 380],
+    platforms: [
+      // ground left
+      new Platform(0, 420, 330, 160, 'grass'),
+      // wall
+      new Platform(330, 250, 36, 170, 'stone'),
+      // ground right
+      new Platform(366, 420, 534, 160, 'grass'),
+      // P1 upper ledge
+      new Platform(30, 310, 160, 20, 'wood'),
+    ],
+    plates: [
+      new Plate(60, 300, 90, '#e84040', []),   // P1 plate — keeps door open
+    ],
+    switches: [
+      new Switch(500, 400, '#44ff88', ['exit_gate']),
+    ],
+    doors: [
+      new Door(330, 250, 170, '#cc4444', 'main_gate'),
+      new Door(640, 290, 130, '#44cc66', 'exit_gate'),
+    ],
+    keys: [],
+    lock: null,
+    exit: new ExitDoor(750, 350, 60, 70),
+  },
+  // ── LEVEL 2: THE BOX BRIDGE ────────────────────────────
+  {
+    bg: ['#2a2a4a','#1a1a2a'],
+    name: 'Level 2 — The Bridge',
+    hint: 'Push the box, reach the switch!',
+    p1start: [60, 380], p2start: [90, 380],
+    platforms: [
+      new Platform(0, 420, 380, 160, 'grass'),
+      new Platform(380, 320, 520, 260, 'grass'),
+      // box platform for P2
+      new Platform(500, 310, 160, 20, 'wood'),
+    ],
+    plates: [
+      new Plate(590, 300, 80, '#4488ff', ['exit_gate2']),
+    ],
+    switches: [],
+    doors: [
+      new Door(640, 230, 90, '#44cc66', 'exit_gate2'),
+    ],
+    keys: [],
+    lock: null,
+    exit: new ExitDoor(750, 350, 60, 70),
+    box: { x: 240, y: 388, w: 50, h: 50, color: '#c09050' },
+  },
+  // ── LEVEL 3: THE TWO KEYS ──────────────────────────────
+  {
+    bg: ['#3a2a1a','#221800'],
+    name: 'Level 3 — The Two Keys',
+    hint: 'Each player collects their key!',
+    p1start: [420, 380], p2start: [440, 380],
+    platforms: [
+      // middle ground
+      new Platform(300, 420, 300, 160, 'grass'),
+      // left upper (P1 key area)
+      new Platform(0, 300, 300, 20, 'wood'),
+      new Platform(0, 420, 300, 160, 'grass'),
+      // right upper (P2 key area)
+      new Platform(600, 300, 300, 20, 'wood'),
+      new Platform(600, 420, 300, 160, 'grass'),
+      // center elevated platform
+      new Platform(360, 340, 180, 20, 'stone'),
+    ],
+    plates: [],
+    switches: [],
+    doors: [
+      new Door(438, 340, 80, '#cc8800', 'key_gate'),
+    ],
+    keys: [
+      new KeyItem(80, 250, '#e84040'),   // P1 red key — left upper
+      new KeyItem(740, 250, '#4488ff'), // P2 blue key — right upper
+    ],
+    lock: new Lock(390, 290, 120, 50),
+    exit: new ExitDoor(414, 420, 72, 70),
+  },
+  // ── LEVEL 4: SYNC ─────────────────────────────────────
+  {
+    bg: ['#1a1a3a','#0d0d22'],
+    name: 'Level 4 — Together!',
+    hint: 'BOTH players must stand on plates at once!',
+    p1start: [300, 380], p2start: [550, 380],
+    platforms: [
+      new Platform(0, 420, 900, 160, 'grass'),
+      new Platform(0, 310, 900, 20, 'stone'),
+      // left plate platform
+      new Platform(150, 250, 200, 20, 'stone'),
+      // right plate platform
+      new Platform(550, 250, 200, 20, 'stone'),
+      // exit platform (high)
+      new Platform(370, 170, 160, 20, 'wood'),
+    ],
+    plates: [
+      new Plate(190, 240, 120, '#e84040', ['sync_gate']),
+      new Plate(590, 240, 120, '#4488ff', ['sync_gate']),
+    ],
+    switches: [],
+    doors: [
+      new Door(400, 80, 90, '#cc44cc', 'sync_gate'),
+    ],
+    keys: [],
+    lock: null,
+    exit: new ExitDoor(420, 105, 60, 65),
+  },
+];
+
+// ─── GAME STATE ────────────────────────────────────────────
+let gs = 'menu'; // menu | playing | levelComplete | gameWin
+let lvlIdx = 0;
+let p1, p2, lvl;
+let lockRef = null;
+let syncProgress = 0;
+let syncDisplay = false;
+let lcTimer = 0;
+let bestTimes = [null, null, null, null];
+
+// Box state for level 2
+let box = null;
+let boxVX = 0;
+
+// ─── LEVEL INIT ────────────────────────────────────────────
+function initLevel(i) {
+  lvl = JSON.parse(JSON.stringify(LEVELS[i]));
+  // rebuild objects from plain data
+  const newPlats = [];
+  lvl.platforms.forEach(p => {
+    newPlats.push(new Platform(p.x, p.y, p.w, p.h, p.style));
+  });
+  lvl.platforms = newPlats;
+  const newPlates = lvl.plates.map(pl => new Plate(pl.x, pl.y, pl.w, pl.color, pl.links || []));
+  lvl.plates = newPlates;
+  const newSws = lvl.switches.map(sw => new Switch(sw.x, sw.y, sw.color, sw.links || []));
+  lvl.switches = newSws;
+  const newDoors = lvl.doors.map(d => new Door(d.x, d.y, d.hh, d.color, d.id));
+  lvl.doors = newDoors;
+  lvl.keys = (lvl._keys || []).map(k => new KeyItem(k.x, k.y, k.color, k.sz));
+  if (lvl._exit) lvl.exit = new ExitDoor(lvl._exit.x, lvl._exit.y, lvl._exit.w, lvl._exit.h);
+  if (lvl._lock) lvl.lock = new Lock(lvl._lock.x, lvl._lock.y, lvl._lock.w, lvl._lock.h);
+  if (lvl._box) { box = { x: lvl._box.x, y: lvl._box.y, w: lvl._box.w, h: lvl._box.h, vy: 0, onG: false }; }
+  else box = null;
+  lockRef = lvl.lock;
+  syncProgress = 0; syncDisplay = false;
+  p1 = new Player(1, lvl.p1start[0], lvl.p1start[1], '#e84040', p1keys);
+  p2 = new Player(2, lvl.p2start[0], lvl.p2start[1], '#4488ff', p2keys);
+  lvl.plates.forEach(pl => { pl.who = null; });
+  parts.length = 0;
+}
+
+// ─── UPDATE ───────────────────────────────────────────────
+function update() {
+  if (gs !== 'playing') return;
+
+  // Box update (level 2)
+  if (box) {
+    // P1 pushes box with right key
+    if (keys['KeyD'] && box.x + box.w < W - 10) box.x += 3.5;
+    if (keys['KeyA'] && box.x > 10) box.x -= 3.5;
+    // box gravity
+    box.vy = box.vy || 0;
+    box.vy += GRAV;
+    box.y += box.vy;
+    // ground
+    const groundY = 420 - box.h;
+    if (box.y >= groundY) { box.y = groundY; box.vy = 0; box.onG = true; }
+    // platform collision
+    lvl.platforms.forEach(p => {
+      if (box.x + box.w > p.x && box.x < p.x + p.w &&
+          box.y + box.h > p.y && box.y + box.h < p.y + p.h + 12 && box.vy >= 0) {
+        box.y = p.y - box.h; box.vy = 0; box.onG = true;
+      }
+    });
+  }
+
+  // Plate update
+  lvl.plates.forEach(pl => {
+    pl.who = null;
+    const cx1 = p1.x + p1.w/2, cy1 = p1.y + p1.h;
+    const cx2 = p2.x + p2.w/2, cy2 = p2.y + p2.h;
+    const pressed1 = cx1 > pl.x && cx1 < pl.x + pl.w && cy1 >= pl.y - 4 && cy1 <= pl.y + 12 && p1.onGround;
+    const pressed2 = cx2 > pl.x && cx2 < pl.x + pl.w && cy2 >= pl.y - 4 && cy2 <= pl.y + 12 && p2.onGround;
+    if (pressed1 || pressed2) {
+      pl.who = pressed1 ? 1 : 2;
+      // plate activates linked doors
+      pl.links.forEach(lid => {
+        const d = lvl.doors.find(dd => dd.id === lid);
+        if (d) d.open = true;
+      });
+    } else {
+      // non-toggle: only open while pressed
+      pl.links.forEach(lid => {
+        const d = lvl.doors.find(dd => dd.id === lid);
+        if (d) d.open = false;
+      });
+    }
+  });
+
+  // Door collision
+  lvl.doors.forEach(d => {
+    d.update();
+    if (d.collides()) {
+      [p1, p2].forEach(p => {
+        if (p.x + p.w > d.x && p.x < d.x + d.w && p.y + p.h > d.y && p.y < d.y + d.hh) {
+          // push out
+          if (p.x < d.x + d.w/2) p.x = d.x - p.w;
+          else p.x = d.x + d.w;
+        }
+      });
+    }
+  });
+
+  // Lock update
+  if (lvl.lock) {
+    lvl.lock.p1Key = p1.hasKey;
+    lvl.lock.p2Key = p2.hasKey;
+    if (lvl.lock.opening) {
+      lvl.lock.openCount--;
+      lvl.lock.links && lvl.lock.links.forEach(lid => {
+        const d = lvl.doors.find(dd => dd.id === lid);
+        if (d) d.open = lvl.lock.openCount <= 0;
+      });
+    }
+    // lock collision
+    if (lvl.lock.collides()) {
+      [p1, p2].forEach(p => {
+        if (p.x + p.w > lvl.lock.x && p.x < lvl.lock.x + lvl.lock.w &&
+            p.y + p.h > lvl.lock.y && p.y < lvl.lock.y + lvl.lock.h) {
+          if (p.x < lvl.lock.x + lvl.lock.w/2) p.x = lvl.lock.x - p.w;
+          else p.x = lvl.lock.x + lvl.lock.w;
+        }
+      });
+    }
+  }
+
+  // Player updates
+  const allPlats = box ? [...lvl.platforms, { x: box.x, y: box.y, w: box.w, h: box.h }] : lvl.platforms;
+  p1.update(allPlats, lvl.plates, lvl.doors, lvl.switches, lvl.keys, lvl.exit, lvl.lock);
+  p2.update(allPlats, lvl.plates, lvl.doors, lvl.switches, lvl.keys, lvl.exit, lvl.lock);
+
+  // Sync check (level 4)
+  if (lvlIdx === 3) {
+    const bothOn = lvl.plates.every(pl => pl.isPressed());
+    if (bothOn) {
+      syncProgress++;
+      syncDisplay = true;
+      if (syncProgress === 60) { syncSfx(); spawnPart(450, 220, '#ffcc00', 25); }
+    } else {
+      syncProgress = Math.max(0, syncProgress - 2);
+      if (syncProgress === 0) syncDisplay = false;
+    }
+    if (syncProgress >= 60) {
+      lvl.doors.forEach(d => { if (d.id === 'sync_gate') d.open = true; });
+    }
+  }
+
+  updateParts();
+
+  // Death check
+  if (p1.dead || p2.dead) {
+    loseSfx();
+    lcTimer = 120;
+  }
+
+  // Level complete check
+  if (p1.atExit && p2.atExit) {
+    winSfx();
+    bestTimes[lvlIdx] = 0; // just mark complete
+    gs = 'levelComplete';
+    lcTimer = 180;
+  }
+}
+
+// ─── DRAW ─────────────────────────────────────────────────
+function drawBG() {
+  if (!lvl) return;
+  const [c1, c2] = lvl.bg;
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, c1); grad.addColorStop(1, c2);
+  ctx.fillStyle = grad; ctx.fillRect(0, 0, W, H);
+  // stars / particles
+  ctx.fillStyle = 'rgba(255,255,255,0.6)';
+  for (let i = 0; i < 40; i++) {
+    const sx = (i * 97 + lvlIdx * 50) % W;
+    const sy = (i * 53 + lvlIdx * 30) % (H * 0.6);
+    const sz = (i % 3 === 0) ? 2 : 1;
+    const blink = Math.sin(Date.now() * 0.002 + i) > 0.7 ? 0 : 1;
+    if (blink) ctx.beginPath(), ctx.arc(sx, sy, sz, 0, Math.PI*2), ctx.fill();
+  }
+}
+
+function drawUI() {
+  // Level name
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  roundRect(ctx, W/2 - 120, 8, 240, 36, 10);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 15px Arial';
+  ctx.textAlign = 'center';
+  ctx.fillText(lvl.name, W/2, 32);
+
+  // Hint
+  ctx.fillStyle = '#ffcc0066';
+  roundRect(ctx, W/2 - 160, 48, 320, 28, 8);
+  ctx.fillStyle = '#ffdd66';
+  ctx.font = '13px Arial';
+  ctx.fillText('💡 ' + lvl.hint, W/2, 67);
+
+  // Player status
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 12px Arial';
+  ctx.fillStyle = '#e84040';
+  ctx.fillText('🔴 P1: WASD', 12, 22);
+  if (p1.hasKey) ctx.fillText('🔑', 12, 40);
+  ctx.fillStyle = '#4488ff';
+  ctx.fillText('🔵 P2: ←↑→', 12, 58);
+  if (p2.hasKey) ctx.fillText('🔑', 12, 76);
+
+  // Level dots
+  for (let i = 0; i < 4; i++) {
+    ctx.beginPath();
+    ctx.arc(W - 24 - i * 26, 22, 8, 0, Math.PI*2);
+    ctx.fillStyle = i === lvlIdx ? '#ffcc00' : i < lvlIdx ? '#44cc66' : '#555';
+    ctx.fill();
+    ctx.strokeStyle = '#888'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 10px Arial'; ctx.textAlign = 'center';
+    ctx.fillText(i+1, W - 24 - i*26, 26);
+  }
+
+  // Sync progress bar (level 4)
+  if (lvlIdx === 3 && syncProgress > 0) {
+    const bw = 300, bh = 18, bx = W/2 - bw/2, by = H - 36;
+    ctx.fillStyle = '#333';
+    roundRect(ctx, bx - 2, by - 2, bw + 4, bh + 4, 6);
+    const ratio = syncProgress / 60;
+    const barColor = ratio >= 1 ? '#44ff88' : ratio > 0.5 ? '#ffcc00' : '#ff6644';
+    ctx.fillStyle = barColor;
+    roundRect(ctx, bx, by, bw * ratio, bh, 4);
+    ctx.strokeStyle = '#888'; ctx.lineWidth = 1.5;
+    ctx.strokeRect(bx, by, bw, bh);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 12px Arial'; ctx.textAlign = 'center';
+    ctx.fillText(ratio >= 1 ? '✓ UNLOCKED!' : `SYNC: ${Math.floor(ratio*100)}%`, W/2, by + 13);
+  }
+
+  // Key hints (level 3)
+  if (lvlIdx === 2) {
+    const kks = lvl.keys.filter(k => !k.collected);
+    ctx.font = '11px Arial'; ctx.textAlign = 'center';
+    kks.forEach(k => {
+      ctx.fillStyle = k.color + 'aa';
+      ctx.fillText(k.who === 1 ? 'P1' : k.who === 2 ? 'P2' : '?',
+        k.x + k.sz/2, k.y - 8);
+    });
+  }
+}
+
+function drawMenu() {
+  const t = Date.now();
+  ctx.fillStyle = '#0a0a1a'; ctx.fillRect(0, 0, W, H);
+  // bg orbs
+  for (let i = 0; i < 8; i++) {
+    const ox = 100 + i * 110 + Math.sin(t * 0.001 + i) * 20;
+    const oy = 100 + Math.cos(t * 0.0015 + i * 1.3) * 60;
+    const g = ctx.createRadialGradient(ox, oy, 0, ox, oy, 60);
+    g.addColorStop(0, ['#e84040','#4488ff','#44cc88','#cc44cc','#ffcc44','#44ccff','#ff8844','#cc44ff'][i] + '33');
+    g.addColorStop(1, 'transparent');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(ox, oy, 60, 0, Math.PI*2); ctx.fill();
+  }
+  // title
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 52px Arial';
+  ctx.textAlign = 'center';
+  ctx.fillText('TOGETHER', W/2, 160);
+  ctx.fillStyle = '#ffcc00';
+  ctx.font = 'bold 60px Arial';
+  ctx.fillText('WE GO', W/2, 225);
+  ctx.fillStyle = '#aaa';
+  ctx.font = '18px Arial';
+  ctx.fillText('2-Player Co-op Platformer', W/2, 260);
+  // instructions
+  const boxes = [
+    { x: W/2 - 200, y: 310, c1: '#e84040', c2: '#ffcc44', label: '🔴 PLAYER 1', keys: 'W A S D', tip: 'Move & Jump' },
+    { x: W/2 + 20,  y: 310, c1: '#4488ff', c2: '#44ccff', label: '🔵 PLAYER 2', keys: '←  ↑  →', tip: 'Move & Jump' },
+  ];
+  boxes.forEach(b => {
+    ctx.fillStyle = b.c1 + '33';
+    roundRect(ctx, b.x, b.y, 180, 80, 12);
+    ctx.strokeStyle = b.c1; ctx.lineWidth = 2;
+    roundRect(ctx, b.x, b.y, 180, 80, 12); ctx.stroke();
+    ctx.fillStyle = b.c2; ctx.font = 'bold 16px Arial'; ctx.textAlign = 'center';
+    ctx.fillText(b.label, b.x + 90, b.y + 26);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 20px Arial';
+    ctx.fillText(b.keys, b.x + 90, b.y + 54);
+    ctx.fillStyle = '#aaa'; ctx.font = '13px Arial';
+    ctx.fillText(b.tip, b.x + 90, b.y + 74);
+  });
+  // level desc
+  ctx.fillStyle = '#888'; ctx.font = '13px Arial'; ctx.textAlign = 'center';
+  ctx.fillText('4 Levels of Cooperative Puzzles', W/2, 430);
+  // start button
+  const pulse = 0.85 + Math.sin(t * 0.005) * 0.15;
+  ctx.fillStyle = `rgba(255,204,0,${pulse})`;
+  roundRect(ctx, W/2 - 100, 448, 200, 50, 12);
+  ctx.fillStyle = '#000'; ctx.font = 'bold 22px Arial'; ctx.textAlign = 'center';
+  ctx.fillText('▶  START', W/2, 481);
+  ctx.fillStyle = '#555'; ctx.font = '13px Arial';
+  ctx.fillText('or press ENTER', W/2, 510);
+}
+
+function drawLevelComplete() {
+  ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#ffcc00'; ctx.font = 'bold 52px Arial'; ctx.textAlign = 'center';
+  ctx.fillText('LEVEL CLEAR!', W/2, 200);
+  const stars = 3;
+  ctx.font = '50px Arial';
+  ctx.fillText('⭐'.repeat(stars) + '☆'.repeat(4-stars), W/2, 280);
+  ctx.fillStyle = '#aaa'; ctx.font = '18px Arial';
+  ctx.fillText(`"${lvl.name}" completed!`, W/2, 330);
+  if (lvlIdx < 3) {
+    const pulse = 0.8 + Math.sin(Date.now() * 0.005) * 0.2;
+    ctx.fillStyle = `rgba(68,204,68,${pulse})`;
+    roundRect(ctx, W/2 - 100, 370, 200, 50, 12);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 20px Arial';
+    ctx.fillText('NEXT LEVEL  →', W/2, 402);
+    ctx.fillStyle = '#555'; ctx.font = '13px Arial';
+    ctx.fillText('or press ENTER', W/2, 435);
+  }
+}
+
+function drawGameWin() {
+  ctx.fillStyle = '#0a0a2a'; ctx.fillRect(0, 0, W, H);
+  for (let i = 0; i < 30; i++) {
+    const sx = (i * 97) % W, sy = (i * 53) % H;
+    ctx.fillStyle = ['#ffcc00','#ff6644','#44ff88','#44ccff'][i%4] + '88';
+    ctx.beginPath(); ctx.arc(sx, sy, 3, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.fillStyle = '#ffcc00'; ctx.font = 'bold 60px Arial'; ctx.textAlign = 'center';
+  ctx.fillText('🎉 YOU WIN! 🎉', W/2, 200);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 28px Arial';
+  ctx.fillText('Together you conquered all 4 levels!', W/2, 270);
+  ctx.fillStyle = '#aaa'; ctx.font = '18px Arial';
+  ctx.fillText('The best adventures are shared. 💛', W/2, 320);
+  const pulse = 0.8 + Math.sin(Date.now() * 0.005) * 0.2;
+  ctx.fillStyle = `rgba(68,204,68,${pulse})`;
+  roundRect(ctx, W/2 - 100, 360, 200, 50, 12);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 20px Arial';
+  ctx.fillText('PLAY AGAIN', W/2, 392);
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  if (gs === 'menu') { drawMenu(); return; }
+  if (gs === 'levelComplete') {
+    drawBG();
+    lvl.platforms.forEach(p => p.draw());
+    drawLevelComplete();
+    return;
+  }
+  if (gs === 'gameWin') { drawGameWin(); return; }
+
+  drawBG();
+
+  // Draw box
+  if (box) {
+    const bx = box.x, by = box.y, bw = box.w, bh = box.h;
+    ctx.fillStyle = box.color;
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.fillStyle = '#d4a060';
+    ctx.fillRect(bx + 4, by + 4, bw - 8, bh - 8);
+    ctx.strokeStyle = '#8a6030'; ctx.lineWidth = 2;
+    ctx.strokeRect(bx, by, bw, bh);
+    ctx.fillStyle = '#8a6030';
+    ctx.font = 'bold 14px Arial'; ctx.textAlign = 'center';
+    ctx.fillText('📦', bx + bw/2, by + bh/2 + 5);
+    ctx.fillStyle = '#aaa'; ctx.font = '10px Arial';
+    ctx.fillText('P1 ← →', bx + bw/2, by + bh - 4);
+  }
+
+  // Draw objects
+  lvl.platforms.forEach(p => p.draw());
+  lvl.plates.forEach(pl => pl.draw());
+  lvl.switches.forEach(sw => sw.draw());
+  lvl.doors.forEach(d => d.draw());
+  if (lvl.lock) lvl.lock.draw();
+  lvl.keys.forEach(k => k.draw());
+  if (lvl.exit) lvl.exit.draw();
+
+  // Particles
+  drawParts();
+
+  // Players
+  if (!p1.dead) p1.draw();
+  if (!p2.dead) p2.draw();
+
+  // UI
+  drawUI();
+
+  // Death overlay
+  if (p1.dead || p2.dead) {
+    ctx.fillStyle = 'rgba(200,0,0,0.3)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 36px Arial'; ctx.textAlign = 'center';
+    ctx.fillText('💀 Oops! Press R to retry', W/2, H/2);
+  }
+}
+
+// ─── INPUT HANDLER ────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.code === 'Enter') {
+    if (gs === 'menu') {
+      gs = 'playing'; initLevel(0);
+    } else if (gs === 'levelComplete') {
+      if (lvlIdx < 3) { lvlIdx++; initLevel(lvlIdx); gs = 'playing'; }
+      else { gs = 'gameWin'; }
+    } else if (gs === 'gameWin') {
+      lvlIdx = 0; gs = 'playing'; initLevel(0);
+    }
+  }
+  if (e.code === 'KeyR' && gs === 'playing') {
+    initLevel(lvlIdx);
+  }
+  // mouse click to start
+  if (e.type === 'click') {
+    const rect = C.getBoundingClientRect();
+    const mx = (e.clientX - rect.left) * (W / rect.width);
+    const my = (e.clientY - rect.top) * (H / rect.height);
+    if (gs === 'menu' && mx > W/2-100 && mx < W/2+100 && my > 448 && my < 498) {
+      gs = 'playing'; initLevel(0);
+    }
+    if (gs === 'levelComplete' && mx > W/2-100 && mx < W/2+100 && my > 370 && my < 420) {
+      if (lvlIdx < 3) { lvlIdx++; initLevel(lvlIdx); gs = 'playing'; }
+      else gs = 'gameWin';
+    }
+    if (gs === 'gameWin' && mx > W/2-100 && mx < W/2+100 && my > 360 && my < 410) {
+      lvlIdx = 0; gs = 'playing'; initLevel(0);
+    }
+  }
+});
+C.addEventListener('click', e => {
+  const rect = C.getBoundingClientRect();
+  const mx = (e.clientX - rect.left) * (W / rect.width);
+  const my = (e.clientY - rect.top) * (H / rect.height);
+  if (gs === 'menu' && mx > W/2-100 && mx < W/2+100 && my > 448 && my < 498) {
+    gs = 'playing'; initLevel(0);
+  }
+  if (gs === 'levelComplete' && mx > W/2-100 && mx < W/2+100 && my > 370 && my < 420) {
+    if (lvlIdx < 3) { lvlIdx++; initLevel(lvlIdx); gs = 'playing'; }
+    else gs = 'gameWin';
+  }
+  if (gs === 'gameWin' && mx > W/2-100 && mx < W/2+100 && my > 360 && my < 410) {
+    lvlIdx = 0; gs = 'playing'; initLevel(0);
+  }
+});
+
+// ─── INIT ─────────────────────────────────────────────────
+initLevel(0);
+
+// ─── GAME LOOP ─────────────────────────────────────────────
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
